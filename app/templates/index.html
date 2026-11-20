@@ -120,7 +120,7 @@
 <body>
 <header>
   <h1>住户能源调查 · 权重校准台账</h1>
-  <p>固定样本 {{ data.summary.household_count }} 户 · 街道 {{ data.summary.street_count }} 个 · 住房类型 {{ data.summary.type_count }} 类 · 现行合计 {{ "{:,}".format(data.summary.total_current) }}</p>
+  <p>固定样本 {{ data.summary.household_count }} 户 · 街道 {{ data.summary.street_count }} 个 · 住房类型 {{ data.summary.type_count }} 类 · 现行合计 {{ "{:,}".format(data.summary.total_current) }} · 已入库读数 {{ data.summary.bill_count }} 份 / {{ data.summary.month_count }} 个月</p>
 </header>
 <main>
 
@@ -153,7 +153,91 @@
       <div class="stat"><b>{{ "{:,}".format(data.summary.total_current) }}</b><span>现行权重合计</span></div>
       <div class="stat"><b>{{ data.summary.locked_streets }}</b><span>已锁定街道</span></div>
       <div class="stat"><b>{{ data.summary.publication_count }}</b><span>成功发布次数</span></div>
+      <div class="stat"><b>{{ data.summary.bill_count }}</b><span>已入库读数（份）</span></div>
+      <div class="stat"><b>{{ data.summary.month_count }}</b><span>覆盖月份（个）</span></div>
     </div>
+  </section>
+
+  <section class="card" id="readings">
+    <div class="subhead">
+      <h2>用电读数补报</h2>
+      <p class="hint">同户同月以最后成功入库的读数为准；批内有重复或未知样本号将整批退回，不写库。</p>
+    </div>
+    <form method="post" action="/readings" enctype="multipart/form-data" class="lock-row">
+      <input type="month" name="month" required aria-label="账单月份"
+             value="{{ form.get('month', data.selected_month or '') }}">
+      <input type="file" name="file" accept=".csv,text/csv" required aria-label="读数 CSV 文件">
+      <button type="submit">上传并入库</button>
+      <span class="hint">CSV 需含「样本号、用电量」两列；用电量为非负整数，单位 Wh。</span>
+    </form>
+    {% if data.batches %}
+    <div class="scroll" style="margin-top:14px;">
+      <table>
+        <thead><tr><th>批次</th><th>月份</th><th class="num">行数</th><th class="num">新增</th><th class="num">覆盖</th><th>入库时间</th></tr></thead>
+        <tbody>
+        {% for batch in data.batches %}
+          <tr>
+            <td>#{{ batch.id }}</td>
+            <td class="mono">{{ batch.month }}</td>
+            <td class="num">{{ batch.row_count }}</td>
+            <td class="num">{{ batch.inserted }}</td>
+            <td class="num">{{ batch.replaced }}</td>
+            <td class="mono">{{ batch.accepted_at }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% endif %}
+  </section>
+
+  <section class="card" id="monthly">
+    <div class="subhead">
+      <h2>各街道月度用电水平</h2>
+      {% if data.months %}
+      <form method="get" action="/" class="lock-row">
+        <select name="month" aria-label="选择查看月份">
+          {% for item in data.months %}
+          <option value="{{ item }}" {% if item == data.selected_month %}selected{% endif %}>{{ item }}</option>
+          {% endfor %}
+        </select>
+        <button type="submit" class="secondary">切换月份</button>
+      </form>
+      {% endif %}
+    </div>
+    {% if data.selected_month %}
+    <p class="hint">{{ data.selected_month }} · 按电量从低到高累计现行权重，取累计权重首次达到或超过已报权重 90% 的电量作为高用电水平（P90）。</p>
+    <table>
+      <thead>
+        <tr>
+          <th>街道</th><th class="num">已报户数</th><th class="num">已报权重合计</th>
+          <th class="num">全部样本权重合计</th><th class="num">覆盖率</th>
+          <th class="num">高用电水平（Wh）</th><th>状态</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for row in data.month_report %}
+        <tr>
+          <td>{{ row.street }}</td>
+          <td class="num">{{ row.reported_households }} / {{ row.household_count }}</td>
+          <td class="num">{{ "{:,}".format(row.reported_weight) }}</td>
+          <td class="num">{{ "{:,}".format(row.total_weight) }}</td>
+          {% if row.reported %}
+            <td class="num">{{ row.coverage_text }}</td>
+            <td class="num">{{ "{:,}".format(row.p90_usage) }}</td>
+            <td><span class="pill">已报</span></td>
+          {% else %}
+            <td class="num">—</td>
+            <td class="num">—</td>
+            <td><span class="pill locked">未报</span></td>
+          {% endif %}
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p class="hint">尚无读数入库，请先在上方选择月份并上传读数 CSV。</p>
+    {% endif %}
   </section>
 
   <section class="card" id="locks">

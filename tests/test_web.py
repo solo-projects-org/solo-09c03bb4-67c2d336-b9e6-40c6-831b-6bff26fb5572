@@ -172,3 +172,137 @@ def test_all_streets_locked_renders_and_type_only_publish(client: TestClient):
 
 def test_healthz(client: TestClient):
     assert client.get("/healthz").json() == {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Monthly readings upload and the per-street report
+# ---------------------------------------------------------------------------
+
+
+def upload(client: TestClient, month: str, csv_text: str):
+    return client.post(
+        "/readings",
+        data={"month": month},
+        files={"file": ("readings.csv", csv_text.encode("utf-8"), "text/csv")},
+    )
+
+
+def test_upload_readings_and_monthly_report(client: TestClient):
+    response = upload(client, "2026-10", "样本号,用电量\nH01,100\nH02,200\n")
+    assert response.status_code == 200
+    assert "已入库" in response.text
+    assert "2026-10" in response.text
+    # Street A reported (weights 2 + 3 = 5 of 5), street B is unreported.
+    assert "已报" in response.text
+    assert "未报" in response.text
+    assert "100.0%" in response.text  # street A coverage, preformatted
+    assert "%.1f%%" not in response.text
+    # P90 for street A: cumulative weights 2 then 5; 90% of 5 = 4.5 -> 200 Wh.
+    data = db.get_dashboard(main._db_path(), month="2026-10")
+    report = {row["street"]: row for row in data.month_report}
+    assert report["A"]["p90_usage"] == 200
+    assert report["A"]["reported_weight"] == 5
+    assert report["A"]["total_weight"] == 5
+    assert report["B"]["reported"] is False
+
+
+def test_upload_rejects_duplicate_sample_ids(client: TestClient):
+    response = upload(client, "2026-10", "样本号,用电量\nH01,100\nH01,200\n")
+    assert response.status_code == 400
+    assert "重复" in response.text
+    assert db.get_bills(main._db_path()) == []
+
+
+def test_upload_rejects_unknown_sample_id(client: TestClient):
+    response = upload(client, "2026-10", "样本号,用电量\nH01,100\nH99,200\n")
+    assert response.status_code == 400
+    assert "不存在" in response.text
+    assert db.get_bills(main._db_path()) == []
+
+
+def test_upload_rejects_bad_usage_and_bad_month(client: TestClient):
+    response = upload(client, "2026-10", "样本号,用电量\nH01,-3\n")
+    assert response.status_code == 400
+    assert "非负整数" in response.text
+    response = upload(client, "2026-13", "样本号,用电量\nH01,3\n")
+    assert response.status_code == 400
+    assert "YYYY-MM" in response.text
+    assert db.get_bills(main._db_path()) == []
+
+
+def test_last_write_wins_via_web(client: TestClient):
+    assert upload(client, "2026-10", "样本号,用电量\nH01,100\n").status_code == 200
+    assert upload(client, "2026-10", "样本号,用电量\nH01,750\n").status_code == 200
+    bills = db.get_bills(main._db_path())
+    assert len(bills) == 1 and bills[0]["usage_wh"] == 750
+    data = db.get_dashboard(main._db_path(), month="2026-10")
+    report = {row["street"]: row for row in data.month_report}
+    assert report["A"]["p90_usage"] == 750
+    # The batch table records both accepted batches.
+    assert len(data.batches) == 2
+    assert data.batches[0]["replaced"] == 1
+
+
+def test_month_selector_lists_all_months(client: TestClient):
+    upload(client, "2026-10", "样本号,用电量\nH01,100\n")
+    upload(client, "2026-11", "样本号,用电量\nH03,400\n")
+    page = client.get("/").text
+    assert 'value="2026-11" selected' in page  # latest month by default
+    october = client.get("/?month=2026-10").text
+    assert 'value="2026-10" selected' in october
+    data = db.get_dashboard(main._db_path(), month="2026-10")
+    report = {row["street"]: row for row in data.month_report}
+    assert report["A"]["reported_weight"] == 2
+    assert report["B"]["reported"] is False
+
+
+def test_interleaved_publish_and_upload_via_web(client: TestClient):
+    # Publish #1 (changes weights), then back-report, then publish #2.
+    values = targets_from(client.get("/").text)
+    assert client.post(
+        "/publish", data={f"target__{k}": v for k, v in values.items()}
+    ).status_code == 200
+    upload(client, "2026-10", "样本号,用电量\nH01,100\nH03,400\n")
+    values = targets_from(client.get("/").text)
+    values["A"] = "6"
+    values["B"] = "4"
+    values["T1"] = "5"
+    values["T2"] = "5"
+    assert client.post(
+        "/publish", data={f"target__{k}": v for k, v in values.items()}
+    ).status_code == 200
+    upload(client, "2026-10", "样本号,用电量\nH02,250\nH04,50\n")
+
+    # The materialized distribution must equal a recompute from committed
+    # bills and weights after every interleaved step.
+    accrued = {}
+    for bill in db.get_bills(main._db_path()):
+        key = (bill["month"], bill["street"], bill["usage_wh"])
+        accrued[key] = accrued.get(key, 0) + bill["current_weight"]
+    materialized = {
+        (row["month"], row["street"], row["usage_wh"]): row["weight_sum"]
+        for row in db.get_distribution(main._db_path())
+    }
+    assert materialized == accrued
+
+    page = client.get("/?month=2026-10").text
+    assert "已报" in page and "未报" not in page  # both streets have readings
+
+
+def test_readings_visible_after_app_restart(client: TestClient):
+    upload(client, "2026-10", "样本号,用电量\nH01,100\nH02,200\n")
+    values = targets_from(client.get("/").text)
+    client.post("/publish", data={f"target__{k}": v for k, v in values.items()})
+    before = db.get_dashboard(main._db_path(), month="2026-10")
+    with TestClient(main.app) as restarted:
+        page = restarted.get("/?month=2026-10").text
+        assert "2026-10" in page
+        assert "已报" in page
+        after = db.get_dashboard(main._db_path(), month="2026-10")
+        assert [
+            (row["street"], row["reported_weight"], row["p90_usage"])
+            for row in after.month_report
+        ] == [
+            (row["street"], row["reported_weight"], row["p90_usage"])
+            for row in before.month_report
+        ]

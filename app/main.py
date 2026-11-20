@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Dict, List, Mapping
 
-from fastapi import FastAPI, Form, Request
+from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
@@ -46,7 +46,7 @@ def _render(
     conflict_message: str | None = None,
     scroll_to: str | None = None,
 ) -> HTMLResponse:
-    data = db.get_dashboard(_db_path())
+    data = db.get_dashboard(_db_path(), month=request.query_params.get("month"))
     notices: List[str] = []
     notice = request.query_params.get("notice")
     if notice:
@@ -96,6 +96,49 @@ def _quote(text: str) -> str:
     from urllib.parse import quote
 
     return quote(text, safe="")
+
+
+@app.post("/readings")
+async def upload_readings(
+    request: Request,
+    month: str = Form(default=""),
+    file: UploadFile = File(...),
+):
+    form_dict = {"month": month}
+    try:
+        month_value = db.validate_month(month)
+        payload = await file.read()
+        if not payload:
+            raise db.ValidationError("上传的 CSV 文件为空")
+        if len(payload) > db.MAX_UPLOAD_BYTES:
+            raise db.ValidationError(
+                f"上传文件过大（上限 {db.MAX_UPLOAD_BYTES // (1024 * 1024)} MB）"
+            )
+        try:
+            text = payload.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            raise db.ValidationError("读数 CSV 必须是 UTF-8 编码")
+        rows = db.parse_readings_csv(text)
+        outcome = db.submit_readings(_db_path(), month_value, rows)
+    except db.ValidationError as exc:
+        return _render(
+            request,
+            status_code=400,
+            errors=[str(exc)],
+            form=form_dict,
+            scroll_to="readings",
+        )
+
+    message = (
+        f"{outcome.month} 批次 #{outcome.batch_id} 已入库：新增 {outcome.inserted} 户读数"
+    )
+    if outcome.replaced:
+        message += f"，覆盖同月已有读数 {outcome.replaced} 户（以本次为准）"
+    message += "。"
+    return RedirectResponse(
+        url="/?notice=" + _quote(message) + f"&month={outcome.month}#monthly",
+        status_code=303,
+    )
 
 
 def _parse_targets(
